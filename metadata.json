@@ -1,0 +1,5 @@
+{
+  "name": "AutoMCQ Pipeline",
+  "description": "End-to-end automated pipeline for extracting, cleaning, and consolidating MCQs from PDFs and web sources into a standardized CSV dataset.",
+  "requestFramePermissions": []
+}
