@@ -5,20 +5,108 @@ import JSZip from 'jszip';
 import { MCQ, PaperConfig } from '../types';
 import { logger } from './loggerService';
 
-// Ensure jsPDF instance is available
-// Some environments might import it as default
-const getJsPDF = () => {
-  if (typeof jsPDF !== 'undefined') return new jsPDF();
-  // Fallback for default export quirks
-  const JSPDF_ANY = (jsPDF as any).default || jsPDF;
-  return new JSPDF_ANY();
+// Ensure globals
+declare global {
+  interface Window {
+    html2canvas: any;
+    katex: any;
+  }
+}
+
+// Helper to render latex-mixed string to HTML string
+const processTextToHTML = (text: string): string => {
+    if (!text) return '';
+    
+    // 1. Convert Markdown Images to HTML Images
+    let processed = text.replace(/!\[(.*?)\]\((.*?)\)/g, '<img src="$2" alt="$1" style="max-width: 100%; height: auto; display: block; margin: 10px 0;" />');
+
+    // 2. Process LaTeX
+    const regex = /(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?:\$[^$\n]+\$))/g;
+    const parts = processed.split(regex);
+    
+    return parts.map(part => {
+        if (part.match(regex)) {
+             // Remove wrappers
+             let latex = part;
+             let display = false;
+             if (part.startsWith('$$')) { latex = part.slice(2, -2); display = true; }
+             else if (part.startsWith('\\[')) { latex = part.slice(2, -2); display = true; }
+             else if (part.startsWith('\\(')) { latex = part.slice(2, -2); }
+             else if (part.startsWith('$')) { latex = part.slice(1, -1); }
+
+             try {
+                return window.katex 
+                    ? window.katex.renderToString(latex, { throwOnError: false, displayMode: display }) 
+                    : part;
+             } catch (e) { return part; }
+        }
+        return `<span>${part}</span>`;
+    }).join('');
+};
+
+// Robust function to convert HTML block (math/images) to canvas data URL
+const renderMathBlockToImage = async (htmlContent: string, widthPx: number): Promise<{dataUrl: string, height: number, width: number} | null> => {
+    if (!window.html2canvas) return null;
+
+    const div = document.createElement('div');
+    // Important: Place it in the viewport but behind everything so it actually renders
+    div.style.position = 'fixed';
+    div.style.top = '0';
+    div.style.left = '0';
+    div.style.zIndex = '-1000';
+    div.style.width = `${widthPx}px`;
+    div.style.fontFamily = 'Helvetica, sans-serif';
+    div.style.fontSize = '12px'; 
+    div.style.color = '#000000';
+    div.style.backgroundColor = '#ffffff'; // White bg is crucial for valid capture
+    div.style.lineHeight = '1.5';
+    div.style.padding = '10px'; // Add padding to avoid cutting off edges
+    div.innerHTML = htmlContent;
+
+    document.body.appendChild(div);
+    
+    // Check for images inside the HTML and wait for them to load
+    const images = div.querySelectorAll('img');
+    if (images.length > 0) {
+        await Promise.all(Array.from(images).map(img => {
+            if (img.complete) return Promise.resolve();
+            return new Promise(resolve => { 
+                img.onload = resolve; 
+                img.onerror = resolve; 
+            });
+        }));
+    }
+    
+    // Critical Delay: Allow fonts (Katex) to layout
+    await new Promise(r => setTimeout(r, 100)); 
+
+    try {
+        const canvas = await window.html2canvas(div, { 
+            scale: 2, 
+            backgroundColor: '#ffffff',
+            logging: false, 
+            useCORS: true,
+            width: widthPx, // Force width
+            windowWidth: widthPx + 50
+        });
+        
+        const dataUrl = canvas.toDataURL('image/png');
+        // Subtract padding from reported width if needed, or just use canvas dims
+        return { dataUrl, height: canvas.height, width: canvas.width };
+    } catch (e) {
+        console.error("Render failed", e);
+        return null;
+    } finally {
+        if (document.body.contains(div)) {
+            document.body.removeChild(div);
+        }
+    }
 };
 
 const addHeader = (doc: any, pageWidth: number, margin: number) => {
     try {
-        // Branding
         doc.setFontSize(22);
-        doc.setTextColor(0, 102, 204); // CGP Blue
+        doc.setTextColor(0, 102, 204); 
         doc.setFont("helvetica", "bold");
         doc.text("CGP Career Avenues", margin, 25);
         
@@ -27,7 +115,6 @@ const addHeader = (doc: any, pageWidth: number, margin: number) => {
         doc.setFont("helvetica", "normal");
         doc.text("Gateway to IITs", margin, 30);
 
-        // Line separator
         doc.setDrawColor(0, 0, 0);
         doc.setLineWidth(0.5);
         doc.line(margin, 35, pageWidth - margin, 35);
@@ -52,20 +139,25 @@ export const shuffleArray = <T>(array: T[]): T[] => {
     return arr;
 };
 
-export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBlob: boolean = false): Blob | void => {
+export const generatePaperPDF = async (questions: MCQ[], config: PaperConfig, returnBlob: boolean = false): Promise<Blob | void> => {
   try {
       logger.info('ExportService', `Starting PDF Generation for ${config.subjectName}. Qs: ${questions.length}`);
       
-      // Initialize PDF
       // @ts-ignore
       const doc = new jsPDF();
       
       const pageWidth = doc.internal.pageSize.width;
       const margin = 15;
+      const contentWidth = pageWidth - (margin * 2);
+
+      // Pixel width for html2canvas approximation
+      // A4 width ~ 210mm. contentWidth ~ 180mm.
+      // 180mm * 3.78px/mm ~ 680px.
+      // We use a slightly wider canvas to ensure text wrapping matches PDF
+      const cssPixelWidth = 700; 
 
       addHeader(doc, pageWidth, margin);
 
-      // --- PAPER INFO ---
       let yPos = 50;
       
       doc.setTextColor(0, 0, 0);
@@ -87,7 +179,6 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
       const totalQuestions = config.sections.reduce((acc, curr) => acc + curr.count, 0);
       const totalMarks = config.sections.reduce((acc, curr) => acc + (curr.count * curr.marksPerQuestion), 0);
 
-      // Safe AutoTable Call
       try {
           autoTable(doc, {
             startY: yPos,
@@ -104,11 +195,10 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
           // @ts-ignore
           yPos = doc.lastAutoTable.finalY + 15;
       } catch (tableErr) {
-          logger.error('ExportService', 'AutoTable failed', tableErr);
-          yPos += 40; // Fallback spacing
+          yPos += 40; 
       }
 
-      // --- GENERAL INSTRUCTIONS ---
+      // --- INSTRUCTIONS ---
       doc.setFontSize(11);
       doc.setFont('helvetica', 'bold');
       doc.text("INSTRUCTIONS:", margin, yPos);
@@ -118,10 +208,10 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
       
       const instructions = [
         "1. This question paper contains multiple sections as detailed above.",
-        "2. NAT (Numerical Answer Type) questions require a specific value.",
-        "3. MSQ (Multiple Select Questions) may have one or more correct options.",
-        "4. Read the questions carefully before selecting your response.",
-        "5. Do not close the browser window during the test."
+        "2. NAT questions require a specific value.",
+        "3. MSQ may have one or more correct options.",
+        "4. Diagrams are included where necessary.",
+        "5. Do not close the browser window."
       ];
 
       instructions.forEach(inst => {
@@ -135,8 +225,7 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
 
       let currentQIndex = 0;
 
-      config.sections.forEach((section, secIdx) => {
-        // Section Header
+      for (const [secIdx, section] of config.sections.entries()) {
         if (yPos > 250) { doc.addPage(); yPos = 20; }
         
         doc.setFillColor(240, 240, 240);
@@ -147,60 +236,116 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
         doc.text(`SECTION ${secIdx + 1}: ${section.type} (${section.marksPerQuestion} Marks)`, margin + 2, yPos + 1);
         yPos += 15;
 
-        // Questions Loop
         for (let i = 0; i < section.count; i++) {
           if (currentQIndex >= questions.length) break;
           const q = questions[currentQIndex];
 
-          // Page break check
           if (yPos > 230) { doc.addPage(); yPos = 20; }
 
-          // Question Text
           doc.setFont('helvetica', 'bold');
           doc.setFontSize(10);
           const qNum = `Q.${currentQIndex + 1}`;
-          
-          const maxTextWidth = pageWidth - margin - 25;
-          const cleanQText = q.question.replace(/\n+/g, ' ').trim();
-          const splitQuestion = doc.splitTextToSize(cleanQText, maxTextWidth);
-          
           doc.text(qNum, margin, yPos);
-          doc.setFont('helvetica', 'normal');
-          doc.text(splitQuestion, margin + 10, yPos);
-          
-          const qHeight = splitQuestion.length * 5;
-          yPos += qHeight + 5;
 
-          // Render Options based on Type
+          const hasMath = q.question.includes('$$') || q.question.includes('\\') || q.question.includes('$');
+          const hasMarkdownImg = q.question.includes('![');
+          const hasDirectImg = !!q.imageUrl;
+
+          let renderSuccess = false;
+
+          // Attempt to render as Rich Content (Math + Image)
+          if ((hasMath || hasMarkdownImg || hasDirectImg) && window.html2canvas) {
+             let htmlToRender = processTextToHTML(q.question);
+             
+             if (hasDirectImg) {
+                 htmlToRender += `<br/><img src="${q.imageUrl}" style="max-width: 100%; height: auto; margin-top: 10px; border: 1px solid #ddd;" />`;
+             }
+
+             const result = await renderMathBlockToImage(htmlToRender, cssPixelWidth);
+             
+             if (result && result.dataUrl) {
+                const { dataUrl, width, height } = result;
+                const ratio = height / width;
+                
+                // Effective width in PDF is contentWidth - 10 (padding)
+                // However, our canvas was 'width' wide (scale 2).
+                // So PDF height = (PDF Width / Canvas Width) * Canvas Height ??
+                // Actually it is cleaner to just use Aspect Ratio.
+                const pdfImgDisplayHeight = (contentWidth - 10) * ratio;
+
+                if (yPos + pdfImgDisplayHeight > 270) {
+                    doc.addPage();
+                    yPos = 20;
+                    doc.text(`${qNum} (Continued)`, margin, yPos);
+                }
+
+                doc.addImage(dataUrl, 'PNG', margin + 8, yPos - 4, contentWidth - 10, pdfImgDisplayHeight);
+                yPos += pdfImgDisplayHeight + 5;
+                renderSuccess = true;
+             }
+          }
+
+          // Fallback
+          if (!renderSuccess) {
+             doc.setFont('helvetica', 'normal');
+             const maxTextWidth = pageWidth - margin - 25;
+             const cleanQText = q.question.replace(/\n+/g, ' ').trim(); 
+             const splitQuestion = doc.splitTextToSize(cleanQText, maxTextWidth);
+             doc.text(splitQuestion, margin + 10, yPos);
+             yPos += (splitQuestion.length * 5) + 5;
+          }
+
+          // OPTIONS
           if (section.type === 'NAT') {
-             // Render Input Box for NAT
+             if (yPos > 260) { doc.addPage(); yPos = 20; }
              doc.setDrawColor(150);
              doc.text("Answer: ", margin + 12, yPos + 5);
-             doc.rect(margin + 30, yPos, 40, 8); // Input box
+             doc.rect(margin + 30, yPos, 40, 8); 
              yPos += 15;
           } else {
-             // Render Options for MCQ/MSQ
              const optArr = [
-                `a) ${q.options.a}`,
-                `b) ${q.options.b}`,
-                `c) ${q.options.c}`,
-                `d) ${q.options.d}`
+                { label: 'a)', text: q.options.a },
+                { label: 'b)', text: q.options.b },
+                { label: 'c)', text: q.options.c },
+                { label: 'd)', text: q.options.d }
              ];
 
-             optArr.forEach(opt => {
+             for (const opt of optArr) {
                 if (yPos > 270) { doc.addPage(); yPos = 20; }
-                const cleanOpt = opt.replace(/\n+/g, ' ').trim();
-                const splitOpt = doc.splitTextToSize(cleanOpt, maxTextWidth);
-                doc.text(splitOpt, margin + 12, yPos);
-                yPos += (splitOpt.length * 5) + 2;
-             });
+                
+                const hasOptMath = opt.text.includes('$$') || opt.text.includes('\\') || opt.text.includes('$');
+                doc.setFont('helvetica', 'normal');
+                let optRenderSuccess = false;
+                
+                if (hasOptMath && window.html2canvas) {
+                   const html = `<b>${opt.label}</b> ${processTextToHTML(opt.text)}`;
+                   const result = await renderMathBlockToImage(html, cssPixelWidth);
+                   
+                   if (result && result.dataUrl) {
+                       const { dataUrl, width, height } = result;
+                       const ratio = height / width;
+                       const pdfImgDisplayHeight = (contentWidth - 10) * ratio;
+
+                       doc.addImage(dataUrl, 'PNG', margin + 12, yPos - 2, contentWidth - 10, pdfImgDisplayHeight);
+                       yPos += pdfImgDisplayHeight + 2;
+                       optRenderSuccess = true;
+                   }
+                } 
+                
+                if (!optRenderSuccess) {
+                   const fullText = `${opt.label} ${opt.text}`;
+                   const splitOpt = doc.splitTextToSize(fullText, contentWidth - 15);
+                   doc.text(splitOpt, margin + 12, yPos);
+                   yPos += (splitOpt.length * 5) + 2;
+                }
+             }
              yPos += 5;
           }
 
-          yPos += 5; // Spacing between questions
+          yPos += 5; 
           currentQIndex++;
         }
-      });
+      }
 
       if (returnBlob) {
         return doc.output('blob');
@@ -213,8 +358,9 @@ export const generatePaperPDF = (questions: MCQ[], config: PaperConfig, returnBl
   }
 };
 
-export const generateSolutionsPDF = (questions: MCQ[], config: PaperConfig, returnBlob: boolean = false): Blob | void => {
+export const generateSolutionsPDF = async (questions: MCQ[], config: PaperConfig, returnBlob: boolean = false): Promise<Blob | void> => {
     try {
+        // ... (Same content as previous but good to ensure full file integrity if requested)
         logger.info('ExportService', 'Starting Solutions PDF generation');
         // @ts-ignore
         const doc = new jsPDF();
@@ -229,12 +375,11 @@ export const generateSolutionsPDF = (questions: MCQ[], config: PaperConfig, retu
         centerText(doc, pageWidth, `KEY & SOLUTIONS: ${config.subjectName.toUpperCase()}`, yPos, 16, 'helvetica', 'bold');
         yPos += 15;
         
-        // Prepare table data for solutions
         const tableBody = questions.map((q, idx) => [
             `${idx + 1}`,
             q.type,
             q.answer || 'N/A',
-            q.explanation || 'No explanation provided.'
+            (q.explanation || 'No explanation provided.').substring(0, 100) + (q.explanation?.length > 100 ? '...' : '')
         ]);
 
         autoTable(doc, {
@@ -284,6 +429,7 @@ export const generatePaperExcel = (questions: MCQ[], config: PaperConfig) => {
         'Option D': q.options.d,
         'Answer Key': q.answer,
         'Explanation': q.explanation,
+        'Image URL': q.imageUrl || '',
         'Marks': section.marksPerQuestion,
         'Negative Marks': section.negativeMarks,
         'Source': q.source_name

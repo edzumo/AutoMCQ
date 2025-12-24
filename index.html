@@ -9,12 +9,16 @@
     <script>
       window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     </script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" integrity="sha384-XjKyJXdxC8Ks0QA487s1948AMg+yHKh560w1z95dQ67HjUwZl6NnO2p9+9h7+7U" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <style>
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
       body {
         font-family: 'Inter', sans-serif;
         background-color: #f3f4f6;
       }
+      .katex { font-size: 1.1em; }
     </style>
   <script type="importmap">
 {
@@ -29,7 +33,8 @@
     "jspdf-autotable": "https://esm.sh/jspdf-autotable@3.8.2",
     "xlsx": "https://esm.sh/xlsx@0.18.5",
     "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.39.7",
-    "jszip": "https://esm.sh/jszip@3.10.1"
+    "jszip": "https://esm.sh/jszip@3.10.1",
+    "katex": "https://esm.sh/katex@0.16.9"
   }
 }
 </script>

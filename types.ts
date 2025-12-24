@@ -15,6 +15,7 @@ export interface MCQ {
   source_type: 'PDF' | 'WEB' | 'SCRAPER' | 'DB';
   source_name: string;
   page_or_url: string;
+  imageUrl?: string; // New field for diagrams
 }
 
 export interface RawChunk {

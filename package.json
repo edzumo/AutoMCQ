@@ -18,7 +18,8 @@
     "jspdf-autotable": "3.8.2",
     "xlsx": "0.18.5",
     "@supabase/supabase-js": "2.39.7",
-    "jszip": "3.10.1"
+    "jszip": "3.10.1",
+    "katex": "0.16.9"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

@@ -28,17 +28,27 @@ EXTRACTION RULES:
 5. **Option Cleaning**: Remove "a)", "A.", "1." prefixes from option text.
 6. **QUALITY FILTER**: DROP questions that are trivial, incomplete, or elementary level (e.g., "What is the full form of CPU?"). Keep only exam-relevant content.
 
+FORMATTING RULES (CRITICAL):
+1. **MATH**: Identify ALL mathematical expressions, formulas, and variables.
+2. **LATEX**: Convert all math into LaTeX syntax enclosed in double dollar signs $$...$$. 
+3. **JSON ESCAPING**: You are outputting a JSON string. **YOU MUST DOUBLE-ESCAPE BACKSLASHES**.
+   - CORRECT: "$$ \\frac{a}{b} $$" (Becomes \frac in JS)
+   - INCORRECT: "$$ \frac{a}{b} $$" (Becomes form feed or error)
+   - CORRECT: "$$ \\int_{0}^{1} $$"
+   - Example: "Calculate $$ x^2 + \\frac{1}{2} $$"
+
 JSON SCHEMA:
 [
   {
     "type": "MCQ" | "MSQ" | "NAT",
-    "question": "Question text here...",
-    "a": "Option A (empty if NAT)",
-    "b": "Option B (empty if NAT)",
-    "c": "Option C (empty if NAT)",
-    "d": "Option D (empty if NAT)",
-    "answer": "Correct Option (e.g., 'a' or 'a,c' or '45.2' for NAT)",
-    "explanation": "Brief explanation if available in source"
+    "question": "Question text with $$math$$...",
+    "a": "Option A text with $$math$$...",
+    "b": "Option B",
+    "c": "Option C",
+    "d": "Option D",
+    "answer": "Correct Option",
+    "explanation": "Explanation with $$math$$...",
+    "imageUrl": "URL of any relevant diagram/image found (optional)"
   }
 ]
 `;
@@ -50,7 +60,7 @@ export const cleanChunkWithAI = async (chunk: RawChunk): Promise<MCQ[]> => {
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: `EXTRACT ALL QUESTIONS (MCQ, MSQ, NAT) FROM THIS TEXT. LOOK FOR ANSWERS/KEYS AS WELL:\n\n${chunk.text}`,
+      contents: `EXTRACT ALL QUESTIONS (MCQ, MSQ, NAT) FROM THIS TEXT. RECONSTRUCT BROKEN MATH SYMBOLS INTO VALID LATEX ($$...$$). REMEMBER TO DOUBLE-ESCAPE BACKSLASHES:\n\n${chunk.text}`,
       config: {
         systemInstruction: CLEANING_SYSTEM_INSTRUCTION,
         responseMimeType: "application/json",
@@ -66,7 +76,8 @@ export const cleanChunkWithAI = async (chunk: RawChunk): Promise<MCQ[]> => {
               c: { type: Type.STRING },
               d: { type: Type.STRING },
               answer: { type: Type.STRING },
-              explanation: { type: Type.STRING }
+              explanation: { type: Type.STRING },
+              imageUrl: { type: Type.STRING, description: "URL of any associated image" }
             },
             required: ["type", "question", "a", "b", "c", "d"]
           }
@@ -98,7 +109,8 @@ export const cleanChunkWithAI = async (chunk: RawChunk): Promise<MCQ[]> => {
       explanation: item.explanation || '',
       source_type: chunk.source_type,
       source_name: chunk.source_name,
-      page_or_url: chunk.page_or_url
+      page_or_url: chunk.page_or_url,
+      imageUrl: item.imageUrl || ''
     }));
 
     logger.info('GeminiService', `Cleaned chunk ${chunk.id}. Found ${questions.length} items.`, { durationMs: duration });
@@ -136,6 +148,12 @@ export const searchAndExtractWebQuestions = async (topic: string, stream?: strin
     - 30% MSQ (Multiple Select) - Testing comprehensive theory depth.
     - 30% MCQ - Application/Analysis based (Match the following, Assertion-Reasoning).
 
+    FORMATTING (CRITICAL):
+    - **Use LaTeX ($$...$$) for ALL mathematical notation.**
+    - **JSON ESCAPING**: You are outputting JSON. **Double-escape backslashes**.
+    - Ensure equations are strictly valid LaTeX.
+    - **IMAGES**: If a question requires a diagram, try to provide a relevant generic URL or leave imageUrl blank.
+
     DOMAIN ENFORCEMENT:
     - Strictly adhere to ${stream} syllabus. 
     - If the topic is generic (e.g., "Probability"), frame the question in the context of ${stream} (e.g., "Probability of packet loss in TCP" for CSE, "Probability of failure in a beam" for Civil).
@@ -150,7 +168,7 @@ export const searchAndExtractWebQuestions = async (topic: string, stream?: strin
       config: {
         tools: [{ googleSearch: {} }],
         // Strengthened system instruction for complexity
-        systemInstruction: "You are an elite academic examiner. You DO NOT generate simple questions. You prioritize lengthy, complex problems that test deep understanding. You reject broad/easy questions.",
+        systemInstruction: "You are an elite academic examiner. You DO NOT generate simple questions. You prioritize lengthy, complex problems that test deep understanding. You reject broad/easy questions. You ALWAYS use LaTeX for math and Double-Escape backslashes in JSON.",
         responseMimeType: "application/json",
         responseSchema: {
             type: Type.ARRAY,
@@ -164,7 +182,8 @@ export const searchAndExtractWebQuestions = async (topic: string, stream?: strin
                 c: { type: Type.STRING },
                 d: { type: Type.STRING },
                 answer: { type: Type.STRING },
-                explanation: { type: Type.STRING }
+                explanation: { type: Type.STRING },
+                imageUrl: { type: Type.STRING }
               },
               required: ["type", "question", "a", "b", "c", "d"]
             }
@@ -197,7 +216,8 @@ export const searchAndExtractWebQuestions = async (topic: string, stream?: strin
       explanation: item.explanation || '',
       source_type: 'WEB',
       source_name: `AI: ${topic}`,
-      page_or_url: sourceUrl
+      page_or_url: sourceUrl,
+      imageUrl: item.imageUrl || ''
     }));
 
   } catch (error: any) {

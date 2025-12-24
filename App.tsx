@@ -34,8 +34,9 @@ const App: React.FC = () => {
   const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
   const [isBulkGenerating, setIsBulkGenerating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isGeneratingSingle, setIsGeneratingSingle] = useState(false);
 
-  // Ref to hold cleanBank to access in closures if needed, though state is usually fine
+  // Ref to hold cleanBank to access in closures if needed
   const cleanBankRef = useRef<MCQ[]>([]);
   useEffect(() => { cleanBankRef.current = cleanBank; }, [cleanBank]);
 
@@ -131,21 +132,15 @@ const App: React.FC = () => {
       const chunk = queueCopy[i];
       if (chunk.status !== 'pending' && chunk.status !== 'failed') continue;
 
-      if (chunk.status !== 'pending') continue;
-
       setQueue(prev => prev.map(c => c.id === chunk.id ? { ...c, status: 'processing' } : c));
-
       const extractedMCQs = await cleanChunkWithAI(chunk);
 
       if (extractedMCQs.length > 0) {
         setCleanBank(prev => [...prev, ...extractedMCQs]);
-        setQueue(prev => prev.map(c => c.id === chunk.id ? { ...c, status: 'completed' } : c));
-      } else {
-        setQueue(prev => prev.map(c => c.id === chunk.id ? { ...c, status: 'completed' } : c));
       }
+      setQueue(prev => prev.map(c => c.id === chunk.id ? { ...c, status: 'completed' } : c));
       
       setProcessedCount(prev => prev + 1);
-      
       await new Promise(r => setTimeout(r, 500));
     }
 
@@ -171,17 +166,26 @@ const App: React.FC = () => {
       return { selected, stats };
   };
 
-  const handleGeneratePaper = (config: PaperConfig, format: 'PDF' | 'EXCEL') => {
+  const handleGeneratePaper = async (config: PaperConfig, format: 'PDF' | 'EXCEL') => {
     setIsPaperModalOpen(false);
+    setIsGeneratingSingle(true);
+    
     const { selected } = selectQuestionsForPaper(cleanBank, config);
 
-    if (format === 'PDF') {
-      generatePaperPDF(selected, config);
-      setTimeout(() => {
-          generateSolutionsPDF(selected, config);
-      }, 1000);
-    } else {
-      generatePaperExcel(selected, config);
+    try {
+        if (format === 'PDF') {
+          await generatePaperPDF(selected, config);
+          setTimeout(async () => {
+              await generateSolutionsPDF(selected, config);
+              setIsGeneratingSingle(false);
+          }, 500);
+        } else {
+          generatePaperExcel(selected, config);
+          setIsGeneratingSingle(false);
+        }
+    } catch (e) {
+        logger.error('App', 'Single generation failed', e);
+        setIsGeneratingSingle(false);
     }
   };
 
@@ -195,22 +199,17 @@ const App: React.FC = () => {
       const errors: string[] = [];
 
       try {
-          logger.info('App', `Starting Bulk Generation. Mode: ${mode}`);
-
           if (mode === 'MULTI_STREAM' && selection.streams) {
               for (const stream of selection.streams) {
                   let questions: MCQ[] = [];
                   let streamNameForFile = stream;
                   
                   if (stream.includes("Current Session")) {
-                      // Use ref to ensure we have latest even if state closure is stale (unlikely but safe)
                       questions = cleanBankRef.current;
                       streamNameForFile = "Current_Session";
-                      logger.info('App', `BulkGen: Using Current Session (${questions.length} Qs)`);
                   } else {
                       const result = await fetchQuestionsByStream(stream);
                       questions = result.data || [];
-                      logger.info('App', `BulkGen: Fetched ${questions.length} Qs for ${stream}`);
                   }
                   
                   if (questions.length === 0) {
@@ -219,29 +218,23 @@ const App: React.FC = () => {
                   }
 
                   const streamConfig = { ...config, subjectName: stream.replace(/Current Session.*/, "Mixed Questions") };
-                  const { selected, stats } = selectQuestionsForPaper(questions, streamConfig);
+                  const { selected } = selectQuestionsForPaper(questions, streamConfig);
 
-                  if (selected.length === 0) {
-                      const details = Object.entries(stats).map(([k,v]: any) => `${k}: Req ${v.requested}/Avail ${v.available}`).join(', ');
-                      errors.push(`Stream '${stream}': Config mismatch (${details})`);
-                      continue;
-                  }
+                  if (selected.length === 0) continue;
 
                   try {
-                    const pdfBlob = generatePaperPDF(selected, streamConfig, true);
-                    const solBlob = generateSolutionsPDF(selected, streamConfig, true);
+                    const pdfBlob = await generatePaperPDF(selected, streamConfig, true);
+                    const solBlob = await generateSolutionsPDF(selected, streamConfig, true);
 
                     if (pdfBlob) files.push({ filename: `${streamNameForFile.replace(/\s+/g,'_')}_QP.pdf`, content: pdfBlob as Blob });
                     if (solBlob) files.push({ filename: `${streamNameForFile.replace(/\s+/g,'_')}_SOL.pdf`, content: solBlob as Blob });
                   } catch (genErr: any) {
-                      logger.error('App', `PDF Gen Error for ${stream}`, genErr);
-                      errors.push(`Stream '${stream}': PDF Generation failed (${genErr.message})`);
+                      errors.push(`Stream '${stream}': PDF Error`);
                   }
               }
           } 
           else if (mode === 'MULTI_SET' && selection.targetStream && selection.setCounts) {
               let questions: MCQ[] = [];
-              
               if (selection.targetStream.includes("Current Session")) {
                   questions = cleanBankRef.current;
               } else {
@@ -249,53 +242,30 @@ const App: React.FC = () => {
                   questions = result.data || [];
               }
               
-              if (questions.length === 0) {
-                  alert(`No questions found for stream: ${selection.targetStream}.`);
-                  setIsBulkGenerating(false);
-                  return;
-              }
-
-              // Pre-check config availability
-              const { selected: testSelect, stats } = selectQuestionsForPaper(questions, config);
-              if (testSelect.length === 0) {
-                   const details = Object.entries(stats).map(([k,v]: any) => `${k}: Req ${v.requested}/Avail ${v.available}`).join(', ');
-                   alert(`Config Mismatch: ${details}`);
-                   setIsBulkGenerating(false);
-                   return;
-              }
-
-              for (let i = 1; i <= selection.setCounts; i++) {
+              if (questions.length > 0) {
+                 for (let i = 1; i <= selection.setCounts; i++) {
                      const setConfig = { ...config, subjectName: `${selection.targetStream.replace("Current Session", "Mixed")} - Set ${String.fromCharCode(64 + i)}` };
                      const { selected } = selectQuestionsForPaper(questions, setConfig);
 
                      try {
-                        const pdfBlob = generatePaperPDF(selected, setConfig, true);
-                        const solBlob = generateSolutionsPDF(selected, setConfig, true);
-
+                        const pdfBlob = await generatePaperPDF(selected, setConfig, true);
+                        const solBlob = await generateSolutionsPDF(selected, setConfig, true);
                         const sanitizedStream = selection.targetStream.replace(/\s+/g,'_');
                         if (pdfBlob) files.push({ filename: `${sanitizedStream}_Set_${i}_QP.pdf`, content: pdfBlob as Blob });
                         if (solBlob) files.push({ filename: `${sanitizedStream}_Set_${i}_SOL.pdf`, content: solBlob as Blob });
-                     } catch (genErr: any) {
-                        logger.error('App', `Failed to generate set ${i}`, genErr);
-                     }
+                     } catch (genErr) {}
+                 }
               }
           }
 
           if (files.length > 0) {
               await createZipBundle(files);
-              if (errors.length > 0) {
-                  alert(`Generated ${files.length/2} papers with some errors:\n\n${errors.join('\n')}`);
-              }
+              if (errors.length > 0) alert(`Generated ${files.length/2} papers with some errors.`);
           } else {
-              if (errors.length > 0) {
-                  alert(`Generation Failed.\n\n${errors.join('\n')}`);
-              } else {
-                  alert("No files generated. Check logs.");
-              }
+              alert("Generation Failed or No Files.");
           }
 
       } catch (e: any) {
-          logger.error('App', 'Bulk Generation Critical Error', e);
           alert(`Error: ${e.message}`);
       } finally {
           setIsBulkGenerating(false);
@@ -310,86 +280,87 @@ const App: React.FC = () => {
     setProcessedCount(0);
     setActiveStream('');
     logger.clear();
-    logger.info('App', 'Data cleared');
   };
 
-  // Prepare streams list including current session if active
   const effectiveStreams = [...dbStreams];
   if (cleanBank.length > 0) {
       effectiveStreams.unshift(`Current Session (${cleanBank.length} Qs)`);
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-gray-50 text-gray-900">
+    <div className="min-h-screen flex flex-col bg-[#f8fafc] text-gray-900 font-sans selection:bg-indigo-100 selection:text-indigo-900">
+      <div className="fixed inset-0 bg-gradient-to-br from-indigo-50/50 via-white to-purple-50/30 pointer-events-none z-0" />
+      
       {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-8 py-4 sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+      <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 px-4 md:px-8 py-4 sticky top-0 z-40 transition-all">
+        <div className="max-w-[1600px] mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="bg-black p-2 rounded-lg">
+            <div className="bg-black p-2.5 rounded-xl shadow-lg shadow-indigo-100">
               <Zap className="text-yellow-400 w-5 h-5 fill-current" />
             </div>
             <div>
-              <h1 className="text-xl font-bold text-gray-900 tracking-tight">AutoMCQ <span className="text-gray-400 font-normal">Pipeline</span></h1>
-              <p className="text-xs text-gray-500 font-medium tracking-wide uppercase">Clean Data Extraction System</p>
+              <h1 className="text-xl font-bold text-gray-900 tracking-tight leading-none">AutoMCQ <span className="text-gray-400 font-medium">Pro</span></h1>
+              <p className="text-[10px] text-gray-500 font-semibold tracking-widest uppercase mt-1">Intelligent Extraction Pipeline</p>
             </div>
           </div>
           
-          <div className="flex items-center gap-4 text-sm">
-             <button
-               onClick={() => setIsSettingsOpen(true)}
-               className={`p-2 rounded-lg transition-colors ${isDBConnected ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-600'}`}
-               title={isDBConnected ? "Database Connected" : "Connect Database"}
-             >
-                <Settings size={18} />
-             </button>
-
-             <button 
-                onClick={() => setIsBulkModalOpen(true)}
-                className="flex items-center gap-2 text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-lg hover:bg-indigo-100 font-medium transition-colors"
-             >
-                 <FolderDown size={16} /> Bulk Papers
-             </button>
-
-             {isAutoSaving ? (
-                <div className="flex items-center gap-1 text-emerald-600 text-xs font-medium animate-pulse">
-                    <Save size={14} /> Saving...
-                </div>
-             ) : (
-                <div className="text-xs text-gray-400">
-                   {cleanBank.length > 0 && cleanBank.length === lastSavedIndex ? 'All Saved' : ''}
-                </div>
+          <div className="flex flex-wrap items-center gap-3 text-sm overflow-x-auto pb-1 md:pb-0 hide-scrollbar">
+             {isGeneratingSingle && (
+                 <div className="flex items-center gap-2 text-indigo-600 font-medium text-xs bg-indigo-50 px-3 py-1.5 rounded-full animate-pulse border border-indigo-100 whitespace-nowrap">
+                     <Loader2 size={12} className="animate-spin" /> Generating PDF...
+                 </div>
              )}
 
-             <div className="flex items-center bg-gray-100 rounded-lg p-1 border border-gray-200">
-                <span className="px-2 text-gray-700 font-medium text-xs">Load DB:</span>
+             <div className="flex items-center gap-2 bg-gray-100/50 rounded-xl p-1 border border-gray-200/50">
+                <button
+                  onClick={() => setIsSettingsOpen(true)}
+                  className={`p-2 rounded-lg transition-all ${isDBConnected ? 'bg-white shadow-sm text-green-600' : 'text-gray-400 hover:text-gray-600'}`}
+                  title={isDBConnected ? "Database Connected" : "Connect Database"}
+                >
+                    <Settings size={16} />
+                </button>
+                <div className="h-4 w-px bg-gray-300 mx-1"></div>
                 <select 
-                   className="bg-white text-gray-900 text-sm focus:ring-0 cursor-pointer outline-none max-w-[150px] border border-gray-200 rounded px-2 py-1"
+                   className="bg-transparent text-gray-700 text-xs font-medium focus:ring-0 cursor-pointer outline-none w-[120px] py-1"
                    onChange={(e) => handleLoadFromDB(e.target.value)}
                    value=""
                    disabled={!isDBConnected}
                 >
-                    <option value="" disabled>{isDBConnected ? "Select Stream" : "No DB"}</option>
+                    <option value="" disabled>{isDBConnected ? "Load Project" : "No DB"}</option>
                     {dbStreams.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
-                {isLoadingDB && <Loader2 className="w-4 h-4 animate-spin ml-2 text-indigo-500" />}
+                {isLoadingDB && <Loader2 className="w-3 h-3 animate-spin mr-2 text-indigo-500" />}
              </div>
+
+             <button 
+                onClick={() => setIsBulkModalOpen(true)}
+                className="flex items-center gap-2 text-gray-700 hover:text-indigo-600 bg-white hover:bg-indigo-50 px-3 py-2 rounded-xl font-medium transition-all border border-gray-200 hover:border-indigo-100 shadow-sm whitespace-nowrap"
+             >
+                 <FolderDown size={16} /> <span className="hidden sm:inline">Bulk Ops</span>
+             </button>
+
+             {isAutoSaving && (
+                <div className="flex items-center gap-1 text-emerald-600 text-xs font-medium animate-pulse whitespace-nowrap">
+                    <Save size={14} /> Saving...
+                </div>
+             )}
           </div>
         </div>
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 bg-gray-50/50 p-6">
-        <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6 h-[calc(100vh-8rem)]">
+      <main className="flex-1 p-4 md:p-6 lg:p-8 relative z-10">
+        <div className="max-w-[1600px] mx-auto grid grid-cols-12 gap-6 h-full lg:h-[calc(100vh-9rem)]">
           
           {/* Left Column: Input & Controls */}
-          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6 h-full">
-            <div className="flex-1 min-h-0">
+          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6 h-auto lg:h-full lg:overflow-hidden">
+            <div className="flex-none lg:flex-1 min-h-0 bg-white/70 backdrop-blur-sm rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
                <IngestionPanel 
                  onAddChunks={handleAddChunks} 
                  onAddDirectMCQs={handleAddDirectMCQs}
                />
             </div>
-            <div className="flex-1 min-h-0">
+            <div className="flex-none lg:flex-1 min-h-0 bg-white/70 backdrop-blur-sm rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
                <ProcessingPanel 
                  queue={queue} 
                  stats={stats} 
@@ -400,7 +371,7 @@ const App: React.FC = () => {
           </div>
 
           {/* Right Column: Data View */}
-          <div className="col-span-12 lg:col-span-8 h-full">
+          <div className="col-span-12 lg:col-span-8 h-[600px] lg:h-full bg-white/70 backdrop-blur-sm rounded-2xl shadow-sm border border-gray-200 overflow-hidden flex flex-col">
              <ResultsTable 
                mcqs={cleanBank} 
                onDownload={handleDownloadCSV}
